@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -8,18 +9,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-import os
-
 # ================= НАСТРОЙКИ =================
 # Считываем данные из переменных окружения (безопасно для GitHub)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 590568180)) # Превращаем в число, с запасным вариантом
+ADMIN_ID = int(os.getenv("ADMIN_ID", 590568180))  # Превращаем в число, с запасным вариантом
 MASTER_USERNAME = os.getenv("MASTER_USERNAME", "LizaSalmi")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@linails_kazan")
+
 # Безопасный путь к базе данных для хостинга
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "nails_schedule.db")
-# =============================================
 # =============================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -96,6 +96,13 @@ def get_services_inline_kb():
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Проверяем, не осталась ли старая таблица slots без колонки date_str
+    c.execute("PRAGMA table_info(slots)")
+    columns = [row[1] for row in c.fetchall()]
+    if columns and "date_str" not in columns:
+        c.execute("DROP TABLE slots")
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS slots (
             date_str TEXT,
@@ -344,7 +351,7 @@ def parse_master_schedule(text: str) -> tuple[dict, str]:
     now = datetime.now()
     year = now.year
     month = now.month
-    month_name = "ОКТЯБРЬ"
+    month_name = MONTH_NAMES_BY_NUM.get(month, "ОКТЯБРЬ")
 
     text_lower = text.lower()
     for m_key, (m_num, m_title) in MONTHS_RU.items():
@@ -393,29 +400,110 @@ def parse_master_schedule(text: str) -> tuple[dict, str]:
     return schedule, month_name
 
 def parse_manual_urgent_booking(text: str):
-    m_date = re.search(r"\b(\d{1,2})\.(\d{1,2})\b", text)
-    m_time = re.search(r"\b(\d{1,2}:\d{2})\b", text)
-    if not m_date or not m_time:
+    """
+    Умный парсер заметки мастера. Понимает любое время и дату:
+    - "катя в 11 30 починка" -> сегодня в 11:30
+    - "катя 11:30 починка завтра" -> завтра в 11:30
+    - "Алина маникюр в 15 18.10" -> 18.10 в 15:00
+    - "Маша снятие 20 октября в 9 45" -> 20.10 в 09:45
+    """
+    # Не перехватываем многострочное расписание или списки через точку с запятой
+    if "\n" in text.strip() or ";" in text:
         return None
 
-    day, month = int(m_date.group(1)), int(m_date.group(2))
-    time_str = m_time.group(1)
-    if len(time_str) == 4:
-        time_str = "0" + time_str
+    now = datetime.now()
+    working = text.strip()
+    date_str = None
 
-    year = datetime.now().year
-    try:
-        date_str = datetime(year, month, day).strftime("%Y-%m-%d")
-    except ValueError:
+    # 1. Ищем дату: сначала ДД.ММ или ДД/ММ (если вторая часть <= 12, а не минуты вроде 30)
+    for m in re.finditer(r"\b(\d{1,2})[./](\d{1,2})\b", working):
+        d_cand, m_cand = int(m.group(1)), int(m.group(2))
+        before = working[:m.start()].strip().lower()
+        if 1 <= d_cand <= 31 and 1 <= m_cand <= 12 and not before.endswith("в"):
+            year = now.year
+            if m_cand < now.month and (now.month - m_cand) > 6:
+                year += 1
+            try:
+                date_str = datetime(year, m_cand, d_cand).strftime("%Y-%m-%d")
+                working = working[:m.start()] + " " + working[m.end():]
+                break
+            except ValueError:
+                pass
+
+    # 2. Если нет ДД.ММ, проверяем слова "сегодня", "завтра", "послезавтра"
+    if not date_str:
+        if re.search(r"\bпослезавтра\b", working, flags=re.IGNORECASE):
+            date_str = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+            working = re.sub(r"\bпослезавтра\b", " ", working, flags=re.IGNORECASE)
+        elif re.search(r"\bзавтра\b", working, flags=re.IGNORECASE):
+            date_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            working = re.sub(r"\bзавтра\b", " ", working, flags=re.IGNORECASE)
+        elif re.search(r"\bсегодня\b", working, flags=re.IGNORECASE):
+            date_str = now.strftime("%Y-%m-%d")
+            working = re.sub(r"\bсегодня\b", " ", working, flags=re.IGNORECASE)
+
+    # 3. Если всё ещё нет даты, проверяем формат "18 октября"
+    if not date_str:
+        for m_regex, (m_num, _) in MONTHS_RU.items():
+            pattern = r"\b(\d{1,2})\s+" + m_regex[2:]
+            m_month = re.search(pattern, working, flags=re.IGNORECASE)
+            if m_month:
+                d_cand = int(m_month.group(1))
+                year = now.year
+                if m_num < now.month and (now.month - m_num) > 6:
+                    year += 1
+                try:
+                    date_str = datetime(year, m_num, d_cand).strftime("%Y-%m-%d")
+                    working = working[:m_month.start()] + " " + working[m_month.end():]
+                    break
+                except ValueError:
+                    pass
+
+    # 4. Ищем время:
+    # Вариант А: с предлогом "в" -> "в 11 30", "в 11:30", "в 11.30", "в 11-30", "в 11"
+    time_str = None
+    m_time = re.search(
+        r"(?:^|\s)в\s*([01]?\d|2[0-3])(?:[:.\-\s]\s*([0-5]\d))?\b",
+        working,
+        flags=re.IGNORECASE
+    )
+    if m_time:
+        hh = int(m_time.group(1))
+        mm = int(m_time.group(2)) if m_time.group(2) else 0
+        time_str = f"{hh:02d}:{mm:02d}"
+        working = working[:m_time.start()] + " " + working[m_time.end():]
+    else:
+        # Вариант Б: без предлога "в", но с минутами -> "11:30", "11 30", "11.30", "11-30"
+        m_time2 = re.search(r"\b([01]?\d|2[0-3])[:.\-\s]([0-5]\d)\b", working)
+        if m_time2:
+            hh = int(m_time2.group(1))
+            mm = int(m_time2.group(2))
+            time_str = f"{hh:02d}:{mm:02d}"
+            working = working[:m_time2.start()] + " " + working[m_time2.end():]
+
+    if not time_str:
         return None
 
-    cleaned = text.replace(m_date.group(0), "").replace(m_time.group(0), "")
-    cleaned = re.sub(r"\bв\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # 5. Если дата так и не была указана, проверяем, не осталось ли отдельное число дня (например "18" или "18 числа"), иначе ставим СЕГОДНЯ
+    if not date_str:
+        m_day_only = re.search(r"\b(\d{1,2})(?:\s*числа)?\b", working, flags=re.IGNORECASE)
+        if m_day_only and 1 <= int(m_day_only.group(1)) <= 31:
+            d_cand = int(m_day_only.group(1))
+            try:
+                date_str = datetime(now.year, now.month, d_cand).strftime("%Y-%m-%d")
+                working = working[:m_day_only.start()] + " " + working[m_day_only.end():]
+            except ValueError:
+                date_str = now.strftime("%Y-%m-%d")
+        else:
+            date_str = now.strftime("%Y-%m-%d")
+
+    # 6. Очищаем оставшийся текст для имени клиента и описания услуги/заметки
+    cleaned = re.sub(r"\b(в|на)\b", " ", working, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
 
     if not cleaned:
         name = "Клиент"
-        service_desc = "Срочная запись"
+        service_desc = "Запись вне времени"
     else:
         parts = cleaned.split(" ", 1)
         name = parts[0].capitalize()
@@ -456,8 +544,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "• Нажмите <b>«📋 Активные записи клиентов»</b> для просмотра броней.\n"
             "• Нажмите <b>«📅 Обновить расписание»</b> для публикации окошек.\n"
             "• Нажмите <b>«📅 Мое расписание»</b> для обзора всех занятых и свободных часов.\n"
-            "• Чтобы добавить срочную запись вручную, отправьте боту:\n"
-            "<code>Алина починка ногтя в 19:30 16.10</code>",
+            "• Чтобы добавить запись/заметку на любое время, просто напишите боту, например:\n"
+            "<code>катя в 11 30 починка</code> (запишет на сегодня)\n"
+            "или <code>Алина починка ногтя в 19 30 16.10</code>",
             reply_markup=get_admin_reply_kb(),
             parse_mode="HTML"
         )
@@ -518,11 +607,10 @@ async def btn_check_booking(message: types.Message, state: FSMContext):
     for date_str, time_str, service_title, confirmed in rows:
         status_str = "✅ Подтверждена" if confirmed else "⏳ Ожидает визита"
         
-        # Создаем блок из двух кнопок под каждой записью
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Перенести", callback_data=f"resched:{date_str}:{time_str}")
         kb.button(text="❌ Отменить", callback_data=f"cancel_booking:{date_str}:{time_str}")
-        kb.adjust(2) # Располагаем их в ряд по две
+        kb.adjust(2)
 
         await message.answer(
             f"📋 <b>Ваша запись:</b>\n"
@@ -545,7 +633,7 @@ async def cb_cancel_booking_direct(call: types.CallbackQuery, state: FSMContext)
     old_info = cancel_booking_db(date_str, time_str, save_backup=False)
     await state.clear()
 
-    if old_info:
+    if old_info and call.from_user.id != ADMIN_ID:
         name, phone, username, _, service_title, _ = old_info
         tg_tag = f"@{username}" if username and username != "нет" else "скрыт"
         try:
@@ -561,36 +649,11 @@ async def cb_cancel_booking_direct(call: types.CallbackQuery, state: FSMContext)
             pass
 
     await call.message.edit_text(
-        f"❌ Ваша запись на <b>{format_date_human(date_str)} в {time_str}</b> успешно отменена. Окошко освобождено.",
+        f"❌ Запись на <b>{format_date_human(date_str)} в {time_str}</b> успешно удалена/отменена.",
         parse_mode="HTML"
     )
     await call.message.answer("Главное меню:", reply_markup=get_main_reply_kb(call.from_user.id))
     await call.answer()
-
-    # Создаем инлайн-клавиатуру с кнопкой переноса под КАЖДОЙ записью
-    kb = InlineKeyboardBuilder()
-    
-    for idx, (date_str, time_str, service_title, confirmed) in enumerate(rows, 1):
-        status_str = "✅ Подтверждена" if confirmed else "⏳ Ожидает визита"
-        # Текст карточки записи
-        await message.answer(
-            f"📋 <b>Запись #{idx}:</b>\n"
-            f"💅 Процедура: {service_title}\n"
-            f"📅 День: {format_date_human(date_str)}\n"
-            f"🕒 Время: {time_str}\n"
-            f"📍 Адрес: Ибрагимова 71, 2-ой подъезд, 1-ый этаж, 23-я квартира\n"
-            f"Статус: {status_str}",
-            reply_markup=InlineKeyboardBuilder().button(
-                text=f"🔄 Перенести эту запись ({format_date_human(date_str)} в {time_str})", 
-                callback_data=f"resched:{date_str}:{time_str}"
-            ).as_markup(),
-            parse_mode="HTML"
-        )
-
-    # Отдельное сообщение с кнопкой «Домой» в конце списка
-    home_kb = InlineKeyboardBuilder()
-    home_kb.button(text="🏠 Домой", callback_data="go_home")
-    await message.answer("Вы можете перенести любую запись или вернуться на главный экран:", reply_markup=home_kb.as_markup())
 
 @dp.message(F.text == "🔄 Перенести запись")
 async def btn_reschedule_menu(message: types.Message, state: FSMContext):
@@ -834,12 +897,13 @@ async def enter_phone(message: types.Message, state: FSMContext):
     user = message.from_user
     username = user.username if user.username else "нет"
     name = data["name"]
+    time_str = data["time"]
 
     save_client_profile(user.id, name, phone)
 
     success = book_slot_db(
         date_str=data["date"],
-        time_str=data["time"],
+        time_str=time_str,
         service_key=data["service"],
         name=name,
         phone=phone,
@@ -863,7 +927,7 @@ async def enter_phone(message: types.Message, state: FSMContext):
         f"✅ Вы успешно записаны!\n"
         f"💅 Процедура: {service_title}\n"
         f"📅 День: {human_date}\n"
-        f"🕒 Время: {data['time']}\n"
+        f"🕒 Время: {time_str}\n"
         f"Адрес : Ибрагимова 71, 2-ой подъезд, 1-ый этаж ,23-я квартира\n"
         f"До встречи 🤍",
         reply_markup=get_main_reply_kb(user.id)
@@ -933,7 +997,6 @@ async def admin_my_schedule(message: types.Message, state: FSMContext):
     c = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     
-    # Достаем статус confirmed вместе с остальными данными
     c.execute("""
         SELECT date_str, time_str, is_booked, client_name, service, confirmed 
         FROM slots 
@@ -956,12 +1019,10 @@ async def admin_my_schedule(message: types.Message, state: FSMContext):
         lines.append(f"📌 <b>{format_date_human(d)}</b>:")
         for t, booked, client, srv, confirmed in slots:
             if booked:
-                short_srv = srv.replace("💅 ", "").replace("🦶 ", "").replace("✨ ", "")
+                short_srv = (srv or "").replace("💅 ", "").replace("🦶 ", "").replace("✨ ", "")
                 if confirmed:
-                    # Красный — запись занята и подтверждена
                     lines.append(f"  🔴 <code>{t}</code> — <b>ЗАНЯТО</b> ({client} | {short_srv})")
                 else:
-                    # Желтый — запись занята, но клиент еще не нажал кнопку подтверждения
                     lines.append(f"  🟡 <code>{t}</code> — <b>ЖДЕТ ПОДТВЕРЖДЕНИЯ</b> ({client} | {short_srv})")
             else:
                 lines.append(f"  🟢 <code>{t}</code> — Свободно")
@@ -1041,13 +1102,17 @@ async def admin_free_text_handler(message: types.Message, state: FSMContext):
     if urgent and not re.search(r"\b(12:00;14:00|расписание)\b", message.text.lower()):
         date_str, time_str, name, service_desc = urgent
         add_manual_booking_db(date_str, time_str, name, service_desc)
+        
+        del_kb = InlineKeyboardBuilder()
+        del_kb.button(text="❌ Удалить эту запись", callback_data=f"cancel_booking:{date_str}:{time_str}")
+
         await message.answer(
-            f"✅ <b>Запись вне времени добавлена в активные!</b>\n\n"
+            f"✅ <b>Запись вне времени добавлена в расписание!</b>\n\n"
             f"👤 Клиент: <b>{name}</b>\n"
-            f"💅 Процедура: {service_desc}\n"
+            f"💅 Заметка: {service_desc}\n"
             f"📅 День: {format_date_human(date_str)}\n"
             f"🕒 Время: <b>{time_str}</b>",
-            reply_markup=get_admin_reply_kb(),
+            reply_markup=del_kb.as_markup(),
             parse_mode="HTML"
         )
         return
@@ -1155,6 +1220,17 @@ async def background_reminder_worker():
             """)
             unconfirmed = c.fetchall()
 
+            # 3. ПУШ-БЛАГОДАРНОСТЬ ПОСЛЕ ВИЗИТА
+            c.execute("""
+                SELECT date_str, time_str, client_name, client_tg_id, service, service_key 
+                FROM slots 
+                WHERE is_booked = 1 AND confirmed = 1 AND client_tg_id > 0 AND service NOT LIKE '↳%'
+            """)
+            completed_visits = c.fetchall()
+
+            # Закрываем соединение перед вызовом cancel_booking_db, чтобы избежать блокировки БД
+            conn.close()
+
             for date_str, time_str, name, phone, username, tg_id, srv, reminded_at_str in unconfirmed:
                 rem_dt = datetime.strptime(reminded_at_str, "%Y-%m-%d %H:%M:%S")
                 if (now - rem_dt).total_seconds() >= 6 * 3600:
@@ -1192,33 +1268,16 @@ async def background_reminder_worker():
                     except Exception:
                         pass
 
-            # 3. ПУШ-БЛАГОДАРНОСТЬ ПОСЛЕ ВИЗИТА (срабатывает спустя 2.5 часа после начала сеанса)
-            c.execute("""
-                SELECT date_str, time_str, client_name, client_tg_id, service, service_key 
-                FROM slots 
-                WHERE is_booked = 1 AND confirmed = 1 AND client_tg_id > 0 AND service NOT LIKE '↳%'
-            """)
-            completed_visits = c.fetchall()
-
             for date_str, time_str, name, tg_id, srv, srv_key in completed_visits:
                 visit_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-                # Для комплекса закладываем 4 часа, для обычной услуги — 2 часа
                 duration_hours = 4.0 if srv_key == "combo" else 2.0
                 end_dt = visit_dt + timedelta(hours=duration_hours)
-                
-                # Проверяем, что с момента окончания прошло от 0 до 30 минут, и благодарность еще не отправлялась
-                # (Чтобы не слать повторно, добавим временную отметку или флаг, либо проверим архивы. 
-                # Проще всего: проверяем, что текущее время наступило после окончания визита)
                 time_passed_mins = (now - end_dt).total_seconds() / 60
-                
+
                 if 0 <= time_passed_mins <= 30:
-                    # Проверяем, не отправляли ли уже (можно пометить слот, либо временно перенести в архив)
-                    # Чтобы реализовать просто и надежно без изменения структуры базы, переведем слот в архив или освободим для новых записей,
-                    # а клиенту отправим сообщение:
-                    
                     thanks_kb = InlineKeyboardBuilder()
                     thanks_kb.button(text="💅 Записаться снова", callback_data="open_booking")
-                    
+
                     try:
                         await bot.send_message(
                             tg_id,
@@ -1230,11 +1289,8 @@ async def background_reminder_worker():
                         )
                     except Exception:
                         pass
-                    
-                    # Освобождаем прошедший слот в базе (или архивируем), чтобы он не висел как активный визит
-                    cancel_booking_db(date_str, time_str, save_backup=False)
 
-            conn.close()
+                    cancel_booking_db(date_str, time_str, save_backup=False)
 
         except Exception as e:
             print(f"Ошибка в фоновой проверке: {e}")
