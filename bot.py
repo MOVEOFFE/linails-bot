@@ -16,6 +16,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 590568180)) # Превращаем в число, с запасным вариантом
 MASTER_USERNAME = os.getenv("MASTER_USERNAME", "LizaSalmi")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@linails_kazan")
+# Безопасный путь к базе данных для хостинга
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+DB_PATH = os.path.join(DATA_DIR, "nails_schedule.db")
 # =============================================
 # =============================================
 
@@ -91,7 +94,7 @@ def get_services_inline_kb():
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS slots (
@@ -131,7 +134,7 @@ def init_db():
 def register_user(user: types.User):
     if user.id == ADMIN_ID:
         return
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         INSERT INTO users (tg_id, username, first_name) VALUES (?, ?, ?)
@@ -141,14 +144,14 @@ def register_user(user: types.User):
     conn.close()
 
 def save_client_profile(tg_id: int, name: str, phone: str):
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE users SET saved_name = ?, saved_phone = ? WHERE tg_id = ?", (name, phone, tg_id))
     conn.commit()
     conn.close()
 
 def get_client_profile(tg_id: int):
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT saved_name, saved_phone FROM users WHERE tg_id = ?", (tg_id,))
     row = c.fetchone()
@@ -156,7 +159,7 @@ def get_client_profile(tg_id: int):
     return row
 
 def get_all_users() -> list:
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT tg_id FROM users")
     rows = [r[0] for r in c.fetchall()]
@@ -164,7 +167,7 @@ def get_all_users() -> list:
     return rows
 
 def sync_free_slots_db(parsed_schedule: dict) -> int:
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     added = 0
     for date_str, times in parsed_schedule.items():
@@ -179,7 +182,7 @@ def sync_free_slots_db(parsed_schedule: dict) -> int:
     return added
 
 def get_free_slots_by_date():
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     c.execute("SELECT date_str, time_str FROM slots WHERE is_booked = 0 AND date_str >= ? ORDER BY date_str, time_str", (today_str,))
@@ -204,7 +207,7 @@ def get_available_times_for_service(free_times: list, service_key: str) -> list:
     return available
 
 def cancel_booking_db(date_str: str, time_str: str, save_backup: bool = False):
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         SELECT client_name, client_phone, client_username, client_tg_id, service, service_key 
@@ -253,7 +256,7 @@ def cancel_booking_db(date_str: str, time_str: str, save_backup: bool = False):
     return row
 
 def restore_booking_db(date_str: str, time_str: str) -> bool:
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         SELECT is_booked, last_client_name, last_service_key 
@@ -295,7 +298,7 @@ def restore_booking_db(date_str: str, time_str: str) -> bool:
     return True
 
 def book_slot_db(date_str: str, time_str: str, service_key: str, name: str, phone: str, username: str, tg_id: int) -> bool:
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     slots_to_book = [time_str]
     if service_key == "combo":
@@ -326,7 +329,7 @@ def book_slot_db(date_str: str, time_str: str, service_key: str, name: str, phon
     return True
 
 def add_manual_booking_db(date_str: str, time_str: str, name: str, service_desc: str):
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         INSERT OR REPLACE INTO slots 
@@ -493,7 +496,7 @@ async def cb_open_booking(call: types.CallbackQuery, state: FSMContext):
 @dp.message(F.text == "🔍 Проверить запись")
 async def btn_check_booking(message: types.Message, state: FSMContext):
     await state.clear()
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     c.execute("""
@@ -592,7 +595,7 @@ async def cb_cancel_booking_direct(call: types.CallbackQuery, state: FSMContext)
 @dp.message(F.text == "🔄 Перенести запись")
 async def btn_reschedule_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     c.execute("""
@@ -886,7 +889,7 @@ async def enter_phone(message: types.Message, state: FSMContext):
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "📋 Активные записи клиентов")
 async def admin_show_bookings(message: types.Message, state: FSMContext):
     await state.clear()
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     c.execute("""
@@ -926,7 +929,7 @@ async def admin_show_bookings(message: types.Message, state: FSMContext):
 async def admin_my_schedule(message: types.Message, state: FSMContext):
     """Показывает мастеру полный обзор: свободные, занятые подтвержденные и занятые ожидающие подтверждения слоты"""
     await state.clear()
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     
@@ -1058,7 +1061,7 @@ async def admin_free_text_handler(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("conf_yes:"))
 async def cb_client_confirm_visit(call: types.CallbackQuery):
     _, date_str, time_str = call.data.split(":", 2)
-    conn = sqlite3.connect("nails_schedule.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT is_booked, client_name, service FROM slots WHERE date_str = ? AND time_str = ?", (date_str, time_str))
     row = c.fetchone()
@@ -1103,7 +1106,7 @@ async def background_reminder_worker():
     while True:
         try:
             now = datetime.now()
-            conn = sqlite3.connect("nails_schedule.db")
+            conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
 
             # 1. НАПОМИНАНИЯ ЗА 24 ЧАСА
