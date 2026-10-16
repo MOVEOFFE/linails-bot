@@ -201,8 +201,8 @@ async def process_phone(message: Message, state: FSMContext):
 
   await state.clear()
   await message.answer(
-      f"✅ **Вы успешно записаны!**\n\n📅 Дата: {date}\n⏰ Время: {"
-      f"time}\n💅 Мастер ждет вас!",
+      f"✅ **Вы успешно записаны!**\n\n📅 Дата: {date}\n⏰ Время: {time}\n💅 Мастер"
+      " ждет вас!",
       parse_mode="Markdown",
       reply_markup=get_main_menu(message.from_user.id),
   )
