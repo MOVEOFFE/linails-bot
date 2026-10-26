@@ -1,8 +1,9 @@
 import asyncio
+import html
 import os
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -10,11 +11,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 # ================= НАСТРОЙКИ =================
-# Считываем данные из переменных окружения (безопасно для GitHub)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 590568180))  # Превращаем в число, с запасным вариантом
+ADMIN_ID = int(os.getenv("ADMIN_ID", 590568180))
 MASTER_USERNAME = os.getenv("MASTER_USERNAME", "LizaSalmi")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@linails_kazan")
+
+# Часовой пояс Казани / Москвы (UTC+3), чтобы бот не зависел от времени сервера
+TZ = timezone(timedelta(hours=3))
+
+def get_now() -> datetime:
+    """Возвращает текущее время по Казани (МСК) без tzinfo для удобного сравнения"""
+    return datetime.now(TZ).replace(tzinfo=None)
 
 # Безопасный путь к базе данных для хостинга
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
@@ -97,11 +104,11 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Проверяем, не осталась ли старая таблица slots без колонки date_str
     c.execute("PRAGMA table_info(slots)")
     columns = [row[1] for row in c.fetchall()]
     if columns and "date_str" not in columns:
         c.execute("DROP TABLE slots")
+        columns = []
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS slots (
@@ -117,6 +124,7 @@ def init_db():
             reminded INTEGER DEFAULT 0,
             confirmed INTEGER DEFAULT 0,
             reminded_at TEXT,
+            thanks_sent INTEGER DEFAULT 0,
             last_client_name TEXT,
             last_client_phone TEXT,
             last_client_username TEXT,
@@ -126,6 +134,13 @@ def init_db():
             PRIMARY KEY (date_str, time_str)
         )
     """)
+
+    # Безопасная миграция: добавляем колонку thanks_sent, если база уже была создана ранее
+    c.execute("PRAGMA table_info(slots)")
+    current_cols = [row[1] for row in c.fetchall()]
+    if "thanks_sent" not in current_cols:
+        c.execute("ALTER TABLE slots ADD COLUMN thanks_sent INTEGER DEFAULT 0")
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             tg_id INTEGER PRIMARY KEY,
@@ -191,12 +206,22 @@ def sync_free_slots_db(parsed_schedule: dict) -> int:
 def get_free_slots_by_date():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    c.execute("SELECT date_str, time_str FROM slots WHERE is_booked = 0 AND date_str >= ? ORDER BY date_str, time_str", (today_str,))
+    now = get_now()
+    today_str = now.strftime("%Y-%m-%d")
+    current_time_str = now.strftime("%H:%M")
+
+    c.execute(
+        "SELECT date_str, time_str FROM slots WHERE is_booked = 0 AND date_str >= ? ORDER BY date_str, time_str",
+        (today_str,)
+    )
     rows = c.fetchall()
     conn.close()
+
     schedule = {}
     for d, t in rows:
+        # Не показываем клиентам уже прошедшие часы сегодняшнего дня
+        if d == today_str and t <= current_time_str:
+            continue
         schedule.setdefault(d, []).append(t)
     return schedule
 
@@ -243,7 +268,7 @@ def cancel_booking_db(date_str: str, time_str: str, save_backup: bool = False):
                     last_service = service, last_service_key = service_key,
                     client_name = NULL, client_phone = NULL, client_username = NULL,
                     client_tg_id = NULL, service = NULL, service_key = NULL,
-                    reminded = 0, confirmed = 0, reminded_at = NULL
+                    reminded = 0, confirmed = 0, reminded_at = NULL, thanks_sent = 0
                 WHERE date_str = ? AND time_str = ?
             """, (date_str, t))
         else:
@@ -251,7 +276,7 @@ def cancel_booking_db(date_str: str, time_str: str, save_backup: bool = False):
                 UPDATE slots SET 
                     is_booked = 0, client_name = NULL, client_phone = NULL,
                     client_username = NULL, client_tg_id = NULL, service = NULL,
-                    service_key = NULL, reminded = 0, confirmed = 0, reminded_at = NULL
+                    service_key = NULL, reminded = 0, confirmed = 0, reminded_at = NULL, thanks_sent = 0
                 WHERE date_str = ? AND time_str = ?
             """, (date_str, t))
 
@@ -296,7 +321,7 @@ def restore_booking_db(date_str: str, time_str: str) -> bool:
                 client_name = last_client_name, client_phone = last_client_phone,
                 client_username = last_client_username, client_tg_id = last_client_tg_id,
                 service = last_service, service_key = last_service_key,
-                confirmed = 1, reminded = 1
+                confirmed = 1, reminded = 1, thanks_sent = 0
             WHERE date_str = ? AND time_str = ?
         """, (date_str, t))
 
@@ -327,7 +352,7 @@ def book_slot_db(date_str: str, time_str: str, service_key: str, name: str, phon
         c.execute("""
             UPDATE slots 
             SET is_booked = 1, client_name = ?, client_phone = ?, client_username = ?, 
-                client_tg_id = ?, service = ?, service_key = ?, reminded = 0, confirmed = 0, reminded_at = NULL
+                client_tg_id = ?, service = ?, service_key = ?, reminded = 0, confirmed = 0, reminded_at = NULL, thanks_sent = 0
             WHERE date_str = ? AND time_str = ?
         """, (name, phone, username, tg_id, label, service_key, date_str, t))
 
@@ -340,15 +365,15 @@ def add_manual_booking_db(date_str: str, time_str: str, name: str, service_desc:
     c = conn.cursor()
     c.execute("""
         INSERT OR REPLACE INTO slots 
-        (date_str, time_str, is_booked, client_name, client_phone, client_username, client_tg_id, service, service_key, reminded, confirmed)
-        VALUES (?, ?, 1, ?, 'Вне записи (ЛС)', 'нет', 0, ?, 'custom', 1, 1)
+        (date_str, time_str, is_booked, client_name, client_phone, client_username, client_tg_id, service, service_key, reminded, confirmed, thanks_sent)
+        VALUES (?, ?, 1, ?, 'Вне записи (ЛС)', 'нет', 0, ?, 'custom', 1, 1, 1)
     """, (date_str, time_str, name, f"🔥 {service_desc}"))
     conn.commit()
     conn.close()
 
 # --- ПАРСЕРЫ ---
 def parse_master_schedule(text: str) -> tuple[dict, str]:
-    now = datetime.now()
+    now = get_now()
     year = now.year
     month = now.month
     month_name = MONTH_NAMES_BY_NUM.get(month, "ОКТЯБРЬ")
@@ -403,23 +428,21 @@ def parse_manual_urgent_booking(text: str):
     """
     Умный парсер заметки мастера. Понимает любое время и дату:
     - "катя в 11 30 починка" -> сегодня в 11:30
-    - "катя 11:30 починка завтра" -> завтра в 11:30
+    - "Катя 18.10 11 15 починка ногтя" -> 18.10 в 11:15
     - "Алина маникюр в 15 18.10" -> 18.10 в 15:00
-    - "Маша снятие 20 октября в 9 45" -> 20.10 в 09:45
     """
-    # Не перехватываем многострочное расписание или списки через точку с запятой
     if "\n" in text.strip() or ";" in text:
         return None
 
-    now = datetime.now()
+    now = get_now()
     working = text.strip()
     date_str = None
 
-    # 1. Ищем дату: сначала ДД.ММ или ДД/ММ (если вторая часть <= 12, а не минуты вроде 30)
+    # 1. Ищем дату ДД.ММ или ДД/ММ
     for m in re.finditer(r"\b(\d{1,2})[./](\d{1,2})\b", working):
         d_cand, m_cand = int(m.group(1)), int(m.group(2))
         before = working[:m.start()].strip().lower()
-        if 1 <= d_cand <= 31 and 1 <= m_cand <= 12 and not before.endswith("в"):
+        if 1 <= d_cand <= 31 and 1 <= m_cand <= 12 and not re.search(r"\bв$", before):
             year = now.year
             if m_cand < now.month and (now.month - m_cand) > 6:
                 year += 1
@@ -430,7 +453,7 @@ def parse_manual_urgent_booking(text: str):
             except ValueError:
                 pass
 
-    # 2. Если нет ДД.ММ, проверяем слова "сегодня", "завтра", "послезавтра"
+    # 2. Проверяем слова "сегодня", "завтра", "послезавтра"
     if not date_str:
         if re.search(r"\bпослезавтра\b", working, flags=re.IGNORECASE):
             date_str = (now + timedelta(days=2)).strftime("%Y-%m-%d")
@@ -442,7 +465,7 @@ def parse_manual_urgent_booking(text: str):
             date_str = now.strftime("%Y-%m-%d")
             working = re.sub(r"\bсегодня\b", " ", working, flags=re.IGNORECASE)
 
-    # 3. Если всё ещё нет даты, проверяем формат "18 октября"
+    # 3. Проверяем формат "18 октября"
     if not date_str:
         for m_regex, (m_num, _) in MONTHS_RU.items():
             pattern = r"\b(\d{1,2})\s+" + m_regex[2:]
@@ -459,8 +482,7 @@ def parse_manual_urgent_booking(text: str):
                 except ValueError:
                     pass
 
-    # 4. Ищем время:
-    # Вариант А: с предлогом "в" -> "в 11 30", "в 11:30", "в 11.30", "в 11-30", "в 11"
+    # 4. Ищем время
     time_str = None
     m_time = re.search(
         r"(?:^|\s)в\s*([01]?\d|2[0-3])(?:[:.\-\s]\s*([0-5]\d))?\b",
@@ -473,7 +495,6 @@ def parse_manual_urgent_booking(text: str):
         time_str = f"{hh:02d}:{mm:02d}"
         working = working[:m_time.start()] + " " + working[m_time.end():]
     else:
-        # Вариант Б: без предлога "в", но с минутами -> "11:30", "11 30", "11.30", "11-30"
         m_time2 = re.search(r"\b([01]?\d|2[0-3])[:.\-\s]([0-5]\d)\b", working)
         if m_time2:
             hh = int(m_time2.group(1))
@@ -484,7 +505,7 @@ def parse_manual_urgent_booking(text: str):
     if not time_str:
         return None
 
-    # 5. Если дата так и не была указана, проверяем, не осталось ли отдельное число дня (например "18" или "18 числа"), иначе ставим СЕГОДНЯ
+    # 5. Если дата не указана, ищем число дня или ставим сегодня
     if not date_str:
         m_day_only = re.search(r"\b(\d{1,2})(?:\s*числа)?\b", working, flags=re.IGNORECASE)
         if m_day_only and 1 <= int(m_day_only.group(1)) <= 31:
@@ -497,7 +518,7 @@ def parse_manual_urgent_booking(text: str):
         else:
             date_str = now.strftime("%Y-%m-%d")
 
-    # 6. Очищаем оставшийся текст для имени клиента и описания услуги/заметки
+    # 6. Очищаем оставшийся текст для имени клиента и заметки
     cleaned = re.sub(r"\b(в|на)\b", " ", working, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
 
@@ -541,12 +562,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id == ADMIN_ID:
         await message.answer(
             "👩‍💻 <b>Панель мастера активна!</b>\n\n"
-            "• Нажмите <b>«📋 Активные записи клиентов»</b> для просмотра броней.\n"
+            "• Нажмите <b>«📋 Активные записи клиентов»</b> для просмотра и управления бронями.\n"
             "• Нажмите <b>«📅 Обновить расписание»</b> для публикации окошек.\n"
             "• Нажмите <b>«📅 Мое расписание»</b> для обзора всех занятых и свободных часов.\n"
-            "• Чтобы добавить запись/заметку на любое время, просто напишите боту, например:\n"
+            "• Чтобы добавить запись/заметку на любое время, просто напишите боту:\n"
             "<code>катя в 11 30 починка</code> (запишет на сегодня)\n"
-            "или <code>Алина починка ногтя в 19 30 16.10</code>",
+            "или <code>Катя 28.10 11 15 починка ногтя</code>",
             reply_markup=get_admin_reply_kb(),
             parse_mode="HTML"
         )
@@ -561,7 +582,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "go_home")
 async def cb_go_home(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.delete()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
     await call.message.answer(
         "🏠 Вы вернулись на главный экран. Выберите нужное действие на кнопках внизу 👇",
         reply_markup=get_main_reply_kb(call.from_user.id)
@@ -587,7 +611,7 @@ async def btn_check_booking(message: types.Message, state: FSMContext):
     await state.clear()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = get_now().strftime("%Y-%m-%d")
     c.execute("""
         SELECT date_str, time_str, service, confirmed 
         FROM slots 
@@ -614,7 +638,7 @@ async def btn_check_booking(message: types.Message, state: FSMContext):
 
         await message.answer(
             f"📋 <b>Ваша запись:</b>\n"
-            f"💅 Процедура: {service_title}\n"
+            f"💅 Процедура: {html.escape(service_title or '')}\n"
             f"📅 День: {format_date_human(date_str)}\n"
             f"🕒 Время: {time_str}\n"
             f"📍 Адрес: Ибрагимова 71, 2-ой подъезд, 1-ый этаж, 23-я квартира\n"
@@ -633,20 +657,31 @@ async def cb_cancel_booking_direct(call: types.CallbackQuery, state: FSMContext)
     old_info = cancel_booking_db(date_str, time_str, save_backup=False)
     await state.clear()
 
-    if old_info and call.from_user.id != ADMIN_ID:
-        name, phone, username, _, service_title, _ = old_info
-        tg_tag = f"@{username}" if username and username != "нет" else "скрыт"
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"❌ <b>Клиент отменил запись!</b>\n"
-                f"Окошко снова свободно:\n"
-                f"👤 {name} ({tg_tag}) | {phone}\n"
-                f"📅 Отменено: {format_date_human(date_str)} в {time_str} ({service_title})",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+    if old_info:
+        name, phone, username, client_tg_id, service_title, _ = old_info
+        if call.from_user.id != ADMIN_ID:
+            tg_tag = f"@{username}" if username and username != "нет" else "скрыт"
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"❌ <b>Клиент отменил запись!</b>\n"
+                    f"Окошко снова свободно:\n"
+                    f"👤 {html.escape(name or '')} ({tg_tag}) | {html.escape(phone or '')}\n"
+                    f"📅 Отменено: {format_date_human(date_str)} в {time_str} ({html.escape(service_title or '')})",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        elif client_tg_id and client_tg_id > 0:
+            # Если отменил сам мастер через админку — вежливо уведомляем клиента
+            try:
+                await bot.send_message(
+                    client_tg_id,
+                    f"ℹ️ Ваша запись на <b>{format_date_human(date_str)} в {time_str}</b> была отменена мастером.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
 
     await call.message.edit_text(
         f"❌ Запись на <b>{format_date_human(date_str)} в {time_str}</b> успешно удалена/отменена.",
@@ -660,7 +695,7 @@ async def btn_reschedule_menu(message: types.Message, state: FSMContext):
     await state.clear()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = get_now().strftime("%Y-%m-%d")
     c.execute("""
         SELECT date_str, time_str, service 
         FROM slots 
@@ -684,7 +719,7 @@ async def btn_reschedule_menu(message: types.Message, state: FSMContext):
     kb.adjust(1)
 
     await message.answer(
-        f"У вас есть запись на <b>{format_date_human(date_str)} в {time_str}</b> ({service_title}).\n\n"
+        f"У вас есть запись на <b>{format_date_human(date_str)} в {time_str}</b> ({html.escape(service_title or '')}).\n\n"
         f"При переносе текущее окошко освободится, и вы сразу выберете новую дату и время. Перенести?",
         reply_markup=kb.as_markup(),
         parse_mode="HTML"
@@ -704,8 +739,8 @@ async def cb_reschedule_confirm(call: types.CallbackQuery, state: FSMContext):
                 ADMIN_ID,
                 f"🔄 <b>Клиент переносит запись!</b>\n"
                 f"Старая запись отменена:\n"
-                f"👤 {name} ({tg_tag}) | {phone}\n"
-                f"📅 Было: {format_date_human(date_str)} в {time_str} ({service_title})",
+                f"👤 {html.escape(name or '')} ({tg_tag}) | {html.escape(phone or '')}\n"
+                f"📅 Было: {format_date_human(date_str)} в {time_str} ({html.escape(service_title or '')})",
                 parse_mode="HTML"
             )
         except Exception:
@@ -795,8 +830,6 @@ async def select_date(call: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("time:"))
 async def select_time(call: types.CallbackQuery, state: FSMContext):
     time_str = call.data.split(":", 1)[1]
-    
-    # Сначала обязательно сохраняем выбранное время в память состояний!
     await state.update_data(time=time_str)
     data = await state.get_data()
 
@@ -845,9 +878,9 @@ async def select_time(call: types.CallbackQuery, state: FSMContext):
             await bot.send_message(
                 ADMIN_ID,
                 f"🔔 <b>Новая запись (по сохраненным данным)!</b>\n\n"
-                f"👤 Имя: <b>{saved_name}</b>\n"
+                f"👤 Имя: <b>{html.escape(saved_name)}</b>\n"
                 f"🔗 Ник: {tg_tag}\n"
-                f"📞 Телефон: <code>{saved_phone}</code>\n"
+                f"📞 Телефон: <code>{html.escape(saved_phone)}</code>\n"
                 f"💅 Процедура: {service_title}\n"
                 f"📅 Когда: {human_date} в <b>{time_str}</b>",
                 parse_mode="HTML"
@@ -871,6 +904,10 @@ async def select_time(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(BookingState.name)
 async def enter_name(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Пожалуйста, введите ваше имя текстом:")
+        return
+
     await state.update_data(name=message.text.strip())
     await state.set_state(BookingState.phone)
 
@@ -892,7 +929,14 @@ async def enter_name(message: types.Message, state: FSMContext):
 
 @dp.message(BookingState.phone)
 async def enter_phone(message: types.Message, state: FSMContext):
-    phone = message.contact.phone_number if message.contact else message.text.strip()
+    if message.contact:
+        phone = message.contact.phone_number
+    elif message.text:
+        phone = message.text.strip()
+    else:
+        await message.answer("Пожалуйста, нажмите кнопку отправки контакта или введите номер цифрами:")
+        return
+
     data = await state.get_data()
     user = message.from_user
     username = user.username if user.username else "нет"
@@ -938,9 +982,9 @@ async def enter_phone(message: types.Message, state: FSMContext):
         await bot.send_message(
             ADMIN_ID,
             f"🔔 <b>Новая запись!</b>\n\n"
-            f"👤 Имя: <b>{name}</b>\n"
+            f"👤 Имя: <b>{html.escape(name)}</b>\n"
             f"🔗 Ник: {tg_tag}\n"
-            f"📞 Телефон: <code>{phone}</code>\n"
+            f"📞 Телефон: <code>{html.escape(phone)}</code>\n"
             f"💅 Процедура: {service_title}\n"
             f"📅 Когда: {human_date} в <b>{time_str}</b>",
             parse_mode="HTML"
@@ -955,7 +999,7 @@ async def admin_show_bookings(message: types.Message, state: FSMContext):
     await state.clear()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = get_now().strftime("%Y-%m-%d")
     c.execute("""
         SELECT date_str, time_str, client_name, client_phone, client_username, client_tg_id, service, confirmed 
         FROM slots 
@@ -969,33 +1013,54 @@ async def admin_show_bookings(message: types.Message, state: FSMContext):
         await message.answer("Пока нет активных записей клиентов.", reply_markup=get_admin_reply_kb())
         return
 
-    lines = ["📋 <b>Активные записи клиентов:</b>\n"]
+    await message.answer("📋 <b>Активные записи клиентов:</b>", parse_mode="HTML", reply_markup=get_admin_reply_kb())
+
     for d, t, name, phone, username, tg_id, srv, conf in rows:
         if username and username not in ("None", "нет", ""):
             tg_link = f"<a href='https://t.me/{username.lstrip('@')}'>@{username.lstrip('@')}</a>"
         elif tg_id and tg_id > 0:
             tg_link = f"<a href='tg://user?id={tg_id}'>Написать в ЛС</a>"
         else:
-            tg_link = "ЛС недоступно"
+            tg_link = "Вне записи (ЛС)"
 
         conf_mark = "✅ Подтверждена" if conf else "⏳ Ждет подтверждения"
-        lines.append(
-            f"📅 <b>{format_date_human(d)} в {t}</b> ({conf_mark})\n"
-            f"👤 Имя: <b>{name}</b> | Связь: {tg_link}\n"
-            f"📞 Тел: <code>{phone}</code>\n"
-            f"💅 {srv}\n"
-            f"-----------------------------------"
-        )
-    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_admin_reply_kb(), disable_web_page_preview=True)
+        kb = InlineKeyboardBuilder()
+        if not conf:
+            kb.button(text="✅ Подтвердить", callback_data=f"adm_conf:{d}:{t}")
+        kb.button(text="❌ Отменить запись", callback_data=f"cancel_booking:{d}:{t}")
+        kb.adjust(2)
 
+        await message.answer(
+            f"📅 <b>{format_date_human(d)} в {t}</b> ({conf_mark})\n"
+            f"👤 Имя: <b>{html.escape(name or '')}</b> | Связь: {tg_link}\n"
+            f"📞 Тел: <code>{html.escape(phone or '')}</code>\n"
+            f"💅 {html.escape(srv or '')}",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup(),
+            disable_web_page_preview=True
+        )
+
+@dp.callback_query(F.data.startswith("adm_conf:"))
+async def cb_admin_confirm_manual(call: types.CallbackQuery):
+    _, date_str, time_str = call.data.split(":", 2)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE slots SET confirmed = 1 WHERE date_str = ? AND time_str = ?", (date_str, time_str))
+    conn.commit()
+    conn.close()
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Отменить запись", callback_data=f"cancel_booking:{date_str}:{time_str}")
+    new_text = call.message.html_text.replace("⏳ Ждет подтверждения", "✅ Подтверждена")
+    await call.message.edit_text(new_text, parse_mode="HTML", reply_markup=kb.as_markup(), disable_web_page_preview=True)
+    await call.answer("Запись отмечена как подтвержденная!")
 
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "📅 Мое расписание")
 async def admin_my_schedule(message: types.Message, state: FSMContext):
-    """Показывает мастеру полный обзор: свободные, занятые подтвержденные и занятые ожидающие подтверждения слоты"""
     await state.clear()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = get_now().strftime("%Y-%m-%d")
     
     c.execute("""
         SELECT date_str, time_str, is_booked, client_name, service, confirmed 
@@ -1019,11 +1084,12 @@ async def admin_my_schedule(message: types.Message, state: FSMContext):
         lines.append(f"📌 <b>{format_date_human(d)}</b>:")
         for t, booked, client, srv, confirmed in slots:
             if booked:
-                short_srv = (srv or "").replace("💅 ", "").replace("🦶 ", "").replace("✨ ", "")
+                short_srv = html.escape((srv or "").replace("💅 ", "").replace("🦶 ", "").replace("✨ ", ""))
+                safe_client = html.escape(client or "Клиент")
                 if confirmed:
-                    lines.append(f"  🔴 <code>{t}</code> — <b>ЗАНЯТО</b> ({client} | {short_srv})")
+                    lines.append(f"  🔴 <code>{t}</code> — <b>ЗАНЯТО</b> ({safe_client} | {short_srv})")
                 else:
-                    lines.append(f"  🟡 <code>{t}</code> — <b>ЖДЕТ ПОДТВЕРЖДЕНИЯ</b> ({client} | {short_srv})")
+                    lines.append(f"  🟡 <code>{t}</code> — <b>ЖДЕТ ПОДТВЕРЖДЕНИЯ</b> ({safe_client} | {short_srv})")
             else:
                 lines.append(f"  🟢 <code>{t}</code> — Свободно")
         lines.append("")
@@ -1106,12 +1172,18 @@ async def admin_free_text_handler(message: types.Message, state: FSMContext):
         del_kb = InlineKeyboardBuilder()
         del_kb.button(text="❌ Удалить эту запись", callback_data=f"cancel_booking:{date_str}:{time_str}")
 
+        today_str = get_now().strftime("%Y-%m-%d")
+        past_warning = (
+            "\n\n⚠️ <i>Обратите внимание: эта дата уже в прошлом, поэтому она не отображается в списке будущих записей!</i>"
+            if date_str < today_str else ""
+        )
+
         await message.answer(
             f"✅ <b>Запись вне времени добавлена в расписание!</b>\n\n"
-            f"👤 Клиент: <b>{name}</b>\n"
-            f"💅 Заметка: {service_desc}\n"
+            f"👤 Клиент: <b>{html.escape(name)}</b>\n"
+            f"💅 Заметка: {html.escape(service_desc)}\n"
             f"📅 День: {format_date_human(date_str)}\n"
-            f"🕒 Время: <b>{time_str}</b>",
+            f"🕒 Время: <b>{time_str}</b>{past_warning}",
             reply_markup=del_kb.as_markup(),
             parse_mode="HTML"
         )
@@ -1128,14 +1200,23 @@ async def cb_client_confirm_visit(call: types.CallbackQuery):
     _, date_str, time_str = call.data.split(":", 2)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT is_booked, client_name, service FROM slots WHERE date_str = ? AND time_str = ?", (date_str, time_str))
+    c.execute("SELECT is_booked, client_name, service, service_key FROM slots WHERE date_str = ? AND time_str = ?", (date_str, time_str))
     row = c.fetchone()
     if not row or row[0] == 0:
         conn.close()
         await call.message.edit_text("Эта запись уже была отменена 😔")
         return
 
-    c.execute("UPDATE slots SET confirmed = 1 WHERE date_str = ? AND time_str = ?", (date_str, time_str))
+    # Если это комплекс (2 слота подряд), подтверждаем оба слота сразу
+    slots_to_conf = [time_str]
+    if row[3] == "combo":
+        if time_str == "12:00":
+            slots_to_conf.append("14:00")
+        elif time_str == "14:00":
+            slots_to_conf.append("16:00")
+
+    for t in slots_to_conf:
+        c.execute("UPDATE slots SET confirmed = 1 WHERE date_str = ? AND time_str = ?", (date_str, t))
     conn.commit()
     conn.close()
 
@@ -1147,7 +1228,7 @@ async def cb_client_confirm_visit(call: types.CallbackQuery):
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"✅ Клиент <b>{row[1]}</b> подтвердил(а) запись на <b>{format_date_human(date_str)} в {time_str}</b> ({row[2]})!",
+            f"✅ Клиент <b>{html.escape(row[1] or '')}</b> подтвердил(а) запись на <b>{format_date_human(date_str)} в {time_str}</b> ({html.escape(row[2] or '')})!",
             parse_mode="HTML"
         )
     except Exception:
@@ -1170,7 +1251,7 @@ async def cb_admin_restore_booking(call: types.CallbackQuery):
 async def background_reminder_worker():
     while True:
         try:
-            now = datetime.now()
+            now = get_now()
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
 
@@ -1193,8 +1274,8 @@ async def background_reminder_worker():
                         await bot.send_message(
                             tg_id,
                             f"🔔 <b>Напоминание о записи!</b>\n\n"
-                            f"Здравствуйте, {name}☀️ Напоминаем, что вы записаны на завтра:\n"
-                            f"💅 Процедура: {srv}\n"
+                            f"Здравствуйте, {html.escape(name or '')}☀️ Напоминаем, что вы записаны:\n"
+                            f"💅 Процедура: {html.escape(srv or '')}\n"
                             f"📅 День: {format_date_human(date_str)}\n"
                             f"🕒 Время: {time_str}\n"
                             f"📍 Адрес: Ибрагимова 71, 2-ой подъезд, 1-ый этаж, 23-я квартира\n\n"
@@ -1220,15 +1301,42 @@ async def background_reminder_worker():
             """)
             unconfirmed = c.fetchall()
 
-            # 3. ПУШ-БЛАГОДАРНОСТЬ ПОСЛЕ ВИЗИТА
+            # 3. ПУШ-БЛАГОДАРНОСТЬ ПОСЛЕ ВИЗИТА (без удаления записи из БД!)
             c.execute("""
                 SELECT date_str, time_str, client_name, client_tg_id, service, service_key 
                 FROM slots 
-                WHERE is_booked = 1 AND confirmed = 1 AND client_tg_id > 0 AND service NOT LIKE '↳%'
+                WHERE is_booked = 1 AND confirmed = 1 AND thanks_sent = 0 AND client_tg_id > 0 AND service NOT LIKE '↳%'
             """)
             completed_visits = c.fetchall()
 
-            # Закрываем соединение перед вызовом cancel_booking_db, чтобы избежать блокировки БД
+            for date_str, time_str, name, tg_id, srv, srv_key in completed_visits:
+                visit_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+                duration_hours = 4.0 if srv_key == "combo" else 2.0
+                end_dt = visit_dt + timedelta(hours=duration_hours)
+                time_passed_mins = (now - end_dt).total_seconds() / 60
+
+                if 0 <= time_passed_mins <= 60:
+                    thanks_kb = InlineKeyboardBuilder()
+                    thanks_kb.button(text="💅 Записаться снова", callback_data="open_booking")
+
+                    try:
+                        await bot.send_message(
+                            tg_id,
+                            f"💖 <b>Спасибо, что выбрали Linails!</b>\n\n"
+                            f"Здравствуйте, {html.escape(name or '')}! Надеемся, вам очень понравилась процедура ({html.escape(srv or '')}) ✨\n"
+                            f"Мы всегда ждем вас снова. Будем рады видеть вас у нас еще! 🤍",
+                            reply_markup=thanks_kb.as_markup(),
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+
+                    c.execute(
+                        "UPDATE slots SET thanks_sent = 1 WHERE date_str = ? AND time_str = ?",
+                        (date_str, time_str)
+                    )
+                    conn.commit()
+
             conn.close()
 
             for date_str, time_str, name, phone, username, tg_id, srv, reminded_at_str in unconfirmed:
@@ -1258,39 +1366,15 @@ async def background_reminder_worker():
                         await bot.send_message(
                             ADMIN_ID,
                             f"⚠️ <b>Авто-отмена записи (прошло 6 часов без подтверждения)!</b>\n\n"
-                            f"👤 Клиент: <b>{name}</b> ({tg_tag})\n"
-                            f"📞 Тел: <code>{phone}</code>\n"
-                            f"📅 Когда: {format_date_human(date_str)} в {time_str} ({srv})\n\n"
+                            f"👤 Клиент: <b>{html.escape(name or '')}</b> ({tg_tag})\n"
+                            f"📞 Тел: <code>{html.escape(phone or '')}</code>\n"
+                            f"📅 Когда: {format_date_human(date_str)} в {time_str} ({html.escape(srv or '')})\n\n"
                             f"<i>Окошко снова открыто. Если клиент подтвердил визит в ЛС — нажмите кнопку восстановления:</i>",
                             reply_markup=adm_kb.as_markup(),
                             parse_mode="HTML"
                         )
                     except Exception:
                         pass
-
-            for date_str, time_str, name, tg_id, srv, srv_key in completed_visits:
-                visit_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-                duration_hours = 4.0 if srv_key == "combo" else 2.0
-                end_dt = visit_dt + timedelta(hours=duration_hours)
-                time_passed_mins = (now - end_dt).total_seconds() / 60
-
-                if 0 <= time_passed_mins <= 30:
-                    thanks_kb = InlineKeyboardBuilder()
-                    thanks_kb.button(text="💅 Записаться снова", callback_data="open_booking")
-
-                    try:
-                        await bot.send_message(
-                            tg_id,
-                            f"💖 <b>Спасибо, что выбрали Linails!</b>\n\n"
-                            f"Здравствуйте, {name}! Надеемся, вам очень понравилась процедура ({srv}) ✨\n"
-                            f"Мы всегда ждем вас снова. Будем рады видеть вас у нас еще! 🤍",
-                            reply_markup=thanks_kb.as_markup(),
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-
-                    cancel_booking_db(date_str, time_str, save_backup=False)
 
         except Exception as e:
             print(f"Ошибка в фоновой проверке: {e}")
